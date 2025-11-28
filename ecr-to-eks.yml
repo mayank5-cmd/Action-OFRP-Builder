@@ -1,0 +1,141 @@
+name: Build → ECR → Deploy to EKS
+
+on:
+  push:
+    branches: [ main ]
+
+env:
+  WEB_IMAGE_NAME: talentfithub-web
+  AI_IMAGE_NAME: talentfithub-ai
+
+jobs:
+  build-and-push:
+    name: Build & Push images to ECR
+    runs-on: ubuntu-latest
+    outputs:
+      web_image_sha: ${{ steps.web.outputs.image_sha }}
+      ai_image_sha: ${{ steps.ai.outputs.image_sha }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (optional)
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build & push web image
+        id: web
+        run: |
+          set -e
+          ACCOUNT=${{ secrets.AWS_ACCOUNT_ID }}
+          REGION=${{ secrets.AWS_REGION }}
+          REPO=${{ env.WEB_IMAGE_NAME }}
+          ECR="$ACCOUNT.dkr.ecr.$REGION.amazonaws.com"
+          TAG_SHA="${GITHUB_SHA::8}"
+          IMAGE_LATEST="$ECR/$REPO:latest"
+          IMAGE_SHA="$ECR/$REPO:$TAG_SHA"
+
+          echo "Building $IMAGE_LATEST"
+          docker build -t "$IMAGE_LATEST" -f ./Dockerfile .
+          docker tag "$IMAGE_LATEST" "$IMAGE_SHA"
+          docker push "$IMAGE_LATEST"
+          docker push "$IMAGE_SHA"
+
+          echo "::set-output name=image::$IMAGE_LATEST"
+          echo "::set-output name=image_sha::$IMAGE_SHA"
+          echo "::set-output name=image_sha_tag::$TAG_SHA"
+
+      - name: Build & push ai image
+        id: ai
+        run: |
+          set -e
+          ACCOUNT=${{ secrets.AWS_ACCOUNT_ID }}
+          REGION=${{ secrets.AWS_REGION }}
+          REPO=${{ env.AI_IMAGE_NAME }}
+          ECR="$ACCOUNT.dkr.ecr.$REGION.amazonaws.com"
+          TAG_SHA="${GITHUB_SHA::8}"
+          IMAGE_LATEST="$ECR/$REPO:latest"
+          IMAGE_SHA="$ECR/$REPO:$TAG_SHA"
+
+          echo "Building $IMAGE_LATEST"
+          docker build -t "$IMAGE_LATEST" -f ./ai_service/Dockerfile ./ai_service
+          docker tag "$IMAGE_LATEST" "$IMAGE_SHA"
+          docker push "$IMAGE_LATEST"
+          docker push "$IMAGE_SHA"
+
+          echo "::set-output name=image::$IMAGE_LATEST"
+          echo "::set-output name=image_sha::$IMAGE_SHA"
+          echo "::set-output name=image_sha_tag::$TAG_SHA"
+
+  deploy-to-eks:
+    name: Deploy to EKS cluster
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: '1.27.3'
+
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig --name "${{ secrets.EKS_CLUSTER_NAME }}" --region "${{ secrets.AWS_REGION }}"
+
+      - name: Set image for web deployment
+        id: set-web
+        run: |
+          ECR_REG="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
+          TAG_SHA="${{ needs.build-and-push.outputs.web_image_sha }}"
+          # If output is full image (ECR/...:tag) use it, otherwise form it
+          WEB_IMAGE="$TAG_SHA"
+          if [ -z "$WEB_IMAGE" ] || [ "$WEB_IMAGE" = "null" ]; then
+            echo "Web image not found; exiting"
+            exit 1
+          fi
+          echo "Patching deployment ${DEPLOYMENT_WEB} in namespace ${K8S_NAMESPACE:-default} to use image $WEB_IMAGE"
+          kubectl -n "${K8S_NAMESPACE:-default}" set image deployment/${{ secrets.DEPLOYMENT_WEB }} ${ { secrets.CONTAINER_WEB_NAME } }="$WEB_IMAGE" --record
+
+      - name: Set image for ai deployment
+        id: set-ai
+        run: |
+          AI_IMAGE="${{ needs.build-and-push.outputs.ai_image_sha }}"
+          if [ -z "$AI_IMAGE" ] || [ "$AI_IMAGE" = "null" ]; then
+            echo "AI image not found; exiting"
+            exit 1
+          fi
+          echo "Patching deployment ${DEPLOYMENT_AI} in namespace ${K8S_NAMESPACE:-default} to use image $AI_IMAGE"
+          kubectl -n "${K8S_NAMESPACE:-default}" set image deployment/${{ secrets.DEPLOYMENT_AI }} ${ { secrets.CONTAINER_AI_NAME } }="$AI_IMAGE" --record
+
+      - name: Wait for rollout (web)
+        run: |
+          kubectl -n "${K8S_NAMESPACE:-default}" rollout status deployment/${{ secrets.DEPLOYMENT_WEB }} --timeout=180s
+
+      - name: Wait for rollout (ai)
+        run: |
+          kubectl -n "${K8S_NAMESPACE:-default}" rollout status deployment/${{ secrets.DEPLOYMENT_AI }} --timeout=180s
+
+      - name: Show pods
+        run: kubectl -n "${K8S_NAMESPACE:-default}" get pods -o wide
